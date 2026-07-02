@@ -15,15 +15,6 @@ RATE_WINDOW_SECONDS = 10   # per 10s
 
 app = FastAPI(title="Orders API")
 
-# CORS: allow cross-origin requests from any page (grader will call from a browser)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 # ---- Fixed catalog of orders 1..T ----
 ORDERS_CATALOG = [
     {"id": i, "item": f"Item-{i}", "amount": round(9.99 + i, 2)}
@@ -70,10 +61,30 @@ async def rate_limit_middleware(request: Request, call_next):
             return JSONResponse(
                 status_code=429,
                 content={"detail": "Rate limit exceeded"},
-                headers={"Retry-After": str(retry_after)},
+                headers={
+                    "Retry-After": str(retry_after),
+                    # Fail-safe: add CORS headers directly in case this response
+                    # is emitted before the CORS middleware would otherwise add them.
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Methods": "*",
+                    "Access-Control-Allow-Headers": "*",
+                },
             )
     response = await call_next(request)
     return response
+
+
+# CORS: allow cross-origin requests from any page (grader will call from a browser).
+# Added AFTER the rate-limit middleware so it becomes the OUTERMOST middleware
+# (Starlette makes the most-recently-added middleware outermost), ensuring CORS
+# headers are applied to every response, including 429s and errors.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # ---- Cursor helpers (opaque cursor = base64 of next starting index) ----
