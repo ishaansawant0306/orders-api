@@ -1,6 +1,7 @@
 import time
 import uuid
 from fastapi import FastAPI, Header, Request
+from typing import Optional
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -70,7 +71,7 @@ async def create_order(request: Request, idempotency_key: str = Header(default=N
 
 
 @app.get("/orders")
-async def list_orders(limit: int = 10, cursor: str = None):
+async def list_orders(limit: int = 10, cursor: Optional[str] = None):
     start = 0
     if cursor:
         try:
