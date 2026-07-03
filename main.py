@@ -1,83 +1,11 @@
 import time
 import uuid
-import base64
-import json
-import threading
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from typing import Optional
 
-# ---- Config (assigned values) ----
-TOTAL_ORDERS = 46          # T
-RATE_LIMIT = 18            # R requests
-RATE_WINDOW_SECONDS = 10   # per 10s
+app = FastAPI()
 
-app = FastAPI(title="Orders API")
-
-# ---- Fixed catalog of orders 1..T ----
-ORDERS_CATALOG = [
-    {"id": i, "item": f"Item-{i}", "amount": round(9.99 + i, 2)}
-    for i in range(1, TOTAL_ORDERS + 1)
-]
-
-# ---- Idempotency store: key -> order dict ----
-_idempotency_lock = threading.Lock()
-idempotency_store = {}
-
-# next id counter for newly created orders (starts after catalog range)
-_next_id_lock = threading.Lock()
-_next_order_id = TOTAL_ORDERS + 1
-
-# ---- Rate limiting store: client_id -> list of request timestamps ----
-_rate_lock = threading.Lock()
-rate_buckets = {}
-
-
-def check_rate_limit(client_id: str):
-    now = time.time()
-    with _rate_lock:
-        bucket = rate_buckets.setdefault(client_id, [])
-        # drop timestamps outside the window
-        window_start = now - RATE_WINDOW_SECONDS
-        bucket[:] = [ts for ts in bucket if ts > window_start]
-
-        if len(bucket) >= RATE_LIMIT:
-            oldest = bucket[0]
-            retry_after = max(1, int(RATE_WINDOW_SECONDS - (now - oldest)) + 1)
-            return False, retry_after
-
-        bucket.append(now)
-        return True, None
-
-
-@app.middleware("http")
-async def rate_limit_middleware(request: Request, call_next):
-    # Only rate-limit the API endpoints we care about
-    if request.url.path in ("/orders",):
-        client_id = request.headers.get("X-Client-Id", "anonymous")
-        allowed, retry_after = check_rate_limit(client_id)
-        if not allowed:
-            return JSONResponse(
-                status_code=429,
-                content={"detail": "Rate limit exceeded"},
-                headers={
-                    "Retry-After": str(retry_after),
-                    # Fail-safe: add CORS headers directly in case this response
-                    # is emitted before the CORS middleware would otherwise add them.
-                    "Access-Control-Allow-Origin": "*",
-                    "Access-Control-Allow-Methods": "*",
-                    "Access-Control-Allow-Headers": "*",
-                },
-            )
-    response = await call_next(request)
-    return response
-
-
-# CORS: allow cross-origin requests from any page (grader will call from a browser).
-# Added AFTER the rate-limit middleware so it becomes the OUTERMOST middleware
-# (Starlette makes the most-recently-added middleware outermost), ensuring CORS
-# headers are applied to every response, including 429s and errors.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -86,78 +14,78 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+TOTAL_ORDERS = 46
+RATE_LIMIT = 18
+WINDOW_SECONDS = 10
 
-# ---- Cursor helpers (opaque cursor = base64 of next starting index) ----
-def encode_cursor(index: int) -> str:
-    raw = json.dumps({"idx": index}).encode("utf-8")
-    return base64.urlsafe_b64encode(raw).decode("utf-8")
+# In-memory stores
+idempotency_store = {}  # key -> order dict
+rate_buckets = {}  # client_id -> list of timestamps
+
+CATALOG = [
+    {"id": i, "item": f"Order-{i}", "status": "confirmed"}
+    for i in range(1, TOTAL_ORDERS + 1)
+]
 
 
-def decode_cursor(cursor: str) -> int:
-    try:
-        raw = base64.urlsafe_b64decode(cursor.encode("utf-8"))
-        data = json.loads(raw)
-        return int(data.get("idx", 0))
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid cursor")
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    if request.url.path == "/orders":
+        client_id = request.headers.get("X-Client-Id")
+        if client_id:
+            now = time.time()
+            bucket = rate_buckets.setdefault(client_id, [])
+            # Remove timestamps outside the window
+            bucket[:] = [t for t in bucket if now - t < WINDOW_SECONDS]
+
+            if len(bucket) >= RATE_LIMIT:
+                oldest = bucket[0]
+                retry_after = int(WINDOW_SECONDS - (now - oldest)) + 1
+                return JSONResponse(
+                    status_code=429,
+                    content={"detail": "Rate limit exceeded"},
+                    headers={"Retry-After": str(retry_after)},
+                )
+
+            bucket.append(now)
+
+    response = await call_next(request)
+    return response
 
 
 @app.post("/orders", status_code=201)
-async def create_order(request: Request, idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key")):
-    global _next_order_id
+async def create_order(request: Request, idempotency_key: str = Header(default=None, alias="Idempotency-Key")):
+    if idempotency_key and idempotency_key in idempotency_store:
+        return JSONResponse(content=idempotency_store[idempotency_key], status_code=201)
 
-    if not idempotency_key:
-        raise HTTPException(status_code=400, detail="Idempotency-Key header is required")
+    new_order = {
+        "id": str(uuid.uuid4()),
+        "status": "created",
+    }
 
-    with _idempotency_lock:
-        existing = idempotency_store.get(idempotency_key)
-        if existing:
-            return JSONResponse(status_code=200, content=existing)
+    if idempotency_key:
+        idempotency_store[idempotency_key] = new_order
 
-        # try to read optional body (not required)
-        try:
-            body = await request.json()
-        except Exception:
-            body = {}
-
-        with _next_id_lock:
-            new_id = _next_order_id
-            _next_order_id += 1
-
-        order = {
-            "id": str(new_id),
-            "item": body.get("item", f"Item-{new_id}"),
-            "amount": body.get("amount", round(9.99 + new_id, 2)),
-        }
-        idempotency_store[idempotency_key] = order
-        return JSONResponse(status_code=201, content=order)
+    return JSONResponse(content=new_order, status_code=201)
 
 
 @app.get("/orders")
-async def list_orders(limit: int = 10, cursor: Optional[str] = None):
-    if limit <= 0:
-        raise HTTPException(status_code=400, detail="limit must be positive")
+async def list_orders(limit: int = 10, cursor: str = None):
+    start = 0
+    if cursor:
+        try:
+            start = int(cursor)
+        except ValueError:
+            start = 0
 
-    start_index = 0 if cursor is None else decode_cursor(cursor)
+    end = start + limit
+    page_items = CATALOG[start:end]
 
-    if start_index < 0 or start_index > len(ORDERS_CATALOG):
-        raise HTTPException(status_code=400, detail="Invalid cursor")
-
-    end_index = min(start_index + limit, len(ORDERS_CATALOG))
-    items = ORDERS_CATALOG[start_index:end_index]
-
-    next_cursor = None
-    if end_index < len(ORDERS_CATALOG):
-        next_cursor = encode_cursor(end_index)
+    next_cursor = str(end) if end < TOTAL_ORDERS else None
 
     return {
-        "items": items,
-        "orders": items,       # alias
+        "items": page_items,
         "next_cursor": next_cursor,
-        "next": next_cursor,   # alias
+        "next": next_cursor,
+        "orders": page_items,
     }
-
-
-@app.get("/")
-async def root():
-    return {"status": "ok", "total_orders": TOTAL_ORDERS, "rate_limit": RATE_LIMIT, "rate_window_seconds": RATE_WINDOW_SECONDS}
